@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gestión de Alquileres — Panel de verificación</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --txt:#1f2937; --mut:#6b7280; --ok:#15803d; --err:#b91c1c; --pri:#2563eb; --bd:#e5e7eb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--txt); }
+  header { background:#111827; color:#fff; padding:14px 20px; }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; font-size:13px; color:#9ca3af; }
+  main { max-width:1100px; margin:0 auto; padding:16px; display:grid; gap:16px; }
+  section { background:var(--card); border:1px solid var(--bd); border-radius:8px; padding:16px; }
+  h2 { margin:0 0 12px; font-size:16px; }
+  form { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+  input, select, button { padding:7px 9px; border:1px solid var(--bd); border-radius:6px; font:inherit; }
+  button { background:var(--pri); color:#fff; border-color:var(--pri); cursor:pointer; }
+  button.sec { background:#fff; color:var(--txt); border-color:var(--bd); }
+  button.danger { background:var(--err); border-color:var(--err); }
+  button:disabled { opacity:.6; cursor:wait; }
+  .scroll { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--bd); white-space:nowrap; }
+  .badge { padding:2px 8px; border-radius:999px; font-size:12px; background:#e5e7eb; }
+  .DISPONIBLE, .ACTIVO { background:#dcfce7; color:#166534; }
+  .ALQUILADO { background:#fef3c7; color:#92400e; }
+  .FINALIZADO { background:#dbeafe; color:#1e40af; }
+  .CANCELADO { background:#fee2e2; color:#991b1b; }
+  #mensaje { min-height:20px; font-size:14px; }
+  .ok { color:var(--ok); } .error { color:var(--err); }
+  pre { background:#111827; color:#d1d5db; padding:10px; border-radius:6px; max-height:260px; overflow:auto; font-size:12px; margin:0; white-space:pre-wrap; }
+  .resumen { font-weight:600; margin:8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Gestión de Alquileres — Panel de verificación</h1>
+  <p>Flask · SQLite en memoria · Arquitectura hexagonal. Esta página solo consume la API; las reglas viven en el backend.</p>
+</header>
+
+<main>
+  <div id="mensaje"></div>
+
+  <section>
+    <h2>1. Verificación automática</h2>
+    <button id="btn-verificar">Ejecutar verificación completa</button>
+    <p style="font-size:13px;color:var(--mut)">Crea un vehículo de prueba (placa aleatoria) y recorre las reglas de negocio contra la API real. Los datos de prueba quedan en las tablas.</p>
+    <div id="resumen" class="resumen"></div>
+    <div class="scroll"><table id="tbl-checks"><thead><tr><th></th><th>Comprobación</th><th>Detalle</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section>
+    <h2>2. Vehículos</h2>
+    <form id="form-vehiculo">
+      <input name="placa" placeholder="Placa" required>
+      <input name="marca" placeholder="Marca" required>
+      <input name="modelo" placeholder="Modelo" required>
+      <input name="tarifa_diaria" placeholder="Tarifa diaria" required>
+      <button type="submit">Registrar vehículo</button>
+    </form>
+    <div class="scroll"><table id="tbl-vehiculos"><thead><tr><th>ID</th><th>Placa</th><th>Marca</th><th>Modelo</th><th>Tarifa diaria</th><th>Estado</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section>
+    <h2>3. Alquileres</h2>
+    <form id="form-alquiler">
+      <select name="vehiculo_id" id="sel-vehiculo" required></select>
+      <input name="cliente" placeholder="Cliente" required>
+      <input type="date" name="fecha_inicio" required>
+      <input type="date" name="fecha_fin" required>
+      <button type="submit">Crear alquiler</button>
+    </form>
+    <div class="scroll"><table id="tbl-alquileres"><thead><tr><th>ID</th><th>Vehículo</th><th>Cliente</th><th>Inicio</th><th>Fin</th><th>Días</th><th>Costo total</th><th>Estado</th><th>Acciones</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section>
+    <h2>4. Registro de peticiones HTTP</h2>
+    <button class="sec" id="btn-limpiar" style="margin-bottom:8px">Limpiar</button>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (t) => String(t).replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+
+let vehiculos = [];
+let alquileres = [];
+
+// ---------- Cliente HTTP ----------
+// Las peticiones secuenciales son necesarias porque el servidor usa SQLite en memoria con threaded=False.
+async function api(method, url, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(url, opts);
+  let data = null;
+  try { data = await res.json(); } catch (e) { /* Respuesta sin cuerpo JSON. */ }
+  registrar(method, url, body, res.status, data);
+  return { status: res.status, ok: res.ok, data };
+}
+
+function registrar(method, url, body, status, data) {
+  const linea = `[${new Date().toLocaleTimeString()}] ${method} ${url} -> ${status}\n` +
+    (body !== undefined ? `  petición:  ${JSON.stringify(body)}\n` : '') +
+    `  respuesta: ${JSON.stringify(data)}\n\n`;
+  const el = $('#log');
+  el.textContent = (linea + el.textContent).slice(0, 20000);
+}
+
+function mostrar(r, textoOk) {
+  const m = $('#mensaje');
+  if (r.ok) {
+    m.className = 'ok';
+    m.textContent = textoOk;
+  } else {
+    const error = r.data && r.data.error;
+    m.className = 'error';
+    m.textContent = `Error ${r.status}: ${error ? error.mensaje : 'respuesta inesperada del servidor'}`;
+  }
+}
+
+// ---------- Carga y pintado ----------
+async function refrescar() {
+  const respuestaVehiculos = await api('GET', '/vehiculos');
+  vehiculos = respuestaVehiculos.ok ? respuestaVehiculos.data : [];
+  const respuestaAlquileres = await api('GET', '/alquileres');
+  alquileres = respuestaAlquileres.ok ? respuestaAlquileres.data : [];
+  pintarVehiculos();
+  pintarAlquileres();
+}
+
+function pintarVehiculos() {
+  $('#tbl-vehiculos tbody').innerHTML = vehiculos.map((v) =>
+    `<tr><td>${v.id}</td><td>${esc(v.placa)}</td><td>${esc(v.marca)}</td><td>${esc(v.modelo)}</td>` +
+    `<td>${esc(v.tarifa_diaria)}</td><td><span class="badge ${esc(v.estado)}">${esc(v.estado)}</span></td></tr>`
+  ).join('') || '<tr><td colspan="6">Sin vehículos</td></tr>';
+
+  const disponibles = vehiculos.filter((v) => v.estado === 'DISPONIBLE');
+  $('#sel-vehiculo').innerHTML = disponibles.map((v) =>
+    `<option value="${v.id}">${esc(v.placa)} — ${esc(v.marca)} ${esc(v.modelo)}</option>`
+  ).join('') || '<option value="">(sin vehículos disponibles)</option>';
+}
+
+function pintarAlquileres() {
+  const placa = (id) => (vehiculos.find((v) => v.id === id) || {}).placa || id;
+  $('#tbl-alquileres tbody').innerHTML = alquileres.map((a) => {
+    const acciones = a.estado === 'ACTIVO'
+      ? `<button data-accion="finalizar" data-id="${a.id}">Finalizar</button> ` +
+        `<button class="danger" data-accion="cancelar" data-id="${a.id}">Cancelar</button>`
+      : '';
+    return `<tr><td>${a.id}</td><td>${esc(placa(a.vehiculo_id))}</td><td>${esc(a.cliente)}</td>` +
+      `<td>${esc(a.fecha_inicio)}</td><td>${esc(a.fecha_fin)}</td><td>${a.dias}</td>` +
+      `<td>${esc(a.costo_total)}</td><td><span class="badge ${esc(a.estado)}">${esc(a.estado)}</span></td>` +
+      `<td>${acciones}</td></tr>`;
+  }).join('') || '<tr><td colspan="9">Sin alquileres</td></tr>';
+}
+
+// ---------- Formularios ----------
+$('#form-vehiculo').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const r = await api('POST', '/vehiculos', {
+    placa: f.get('placa'), marca: f.get('marca'), modelo: f.get('modelo'), tarifa_diaria: f.get('tarifa_diaria'),
+  });
+  mostrar(r, 'Vehículo registrado');
+  if (r.ok) e.target.reset();
+  await refrescar();
+});
+
+$('#form-alquiler').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  const r = await api('POST', '/alquileres', {
+    vehiculo_id: Number(f.get('vehiculo_id')), cliente: f.get('cliente'),
+    fecha_inicio: f.get('fecha_inicio'), fecha_fin: f.get('fecha_fin'),
+  });
+  mostrar(r, `Alquiler creado. Costo total (calculado por el backend): ${r.data && r.data.costo_total}`);
+  await refrescar();
+});
+
+$('#tbl-alquileres').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-accion]');
+  if (!btn) return;
+  const { accion, id } = btn.dataset;
+  const r = await api('PUT', `/alquileres/${id}/${accion}`);
+  mostrar(r, accion === 'finalizar' ? 'Alquiler finalizado' : 'Alquiler cancelado');
+  await refrescar();
+});
+
+$('#btn-limpiar').addEventListener('click', () => { $('#log').textContent = ''; });
+
+// ---------- Verificación automática ----------
+$('#btn-verificar').addEventListener('click', async (e) => {
+  const boton = e.target;
+  boton.disabled = true;
+  const checks = [];
+  const check = (nombre, condicion, detalle = '') => checks.push({ nombre, ok: !!condicion, detalle });
+
+  try {
+    const placa = 'T' + Date.now().toString(36).toUpperCase().slice(-5);
+    const veh = { placa, marca: 'Prueba', modelo: '2030', tarifa_diaria: '100000' };
+
+    let r = await api('POST', '/vehiculos', veh);
+    check('Registrar vehículo → 201', r.status === 201, `HTTP ${r.status}`);
+    check('Vehículo nace DISPONIBLE', r.data && r.data.estado === 'DISPONIBLE');
+    const id = r.data && r.data.id;
+    if (!id) throw new Error('No se pudo crear el vehículo de prueba; se detiene la verificación.');
+
+    r = await api('POST', '/vehiculos', veh);
+    check('Placa duplicada → 409', r.status === 409, `HTTP ${r.status}`);
+
+    r = await api('POST', '/vehiculos', { ...veh, placa: placa + 'X', tarifa_diaria: '-5' });
+    check('Tarifa negativa → 400', r.status === 400, `HTTP ${r.status}`);
+
+    r = await api('GET', `/vehiculos/${id}`);
+    check('Consultar vehículo → 200', r.status === 200, `HTTP ${r.status}`);
+
+    r = await api('GET', '/vehiculos/999999');
+    check('Vehículo inexistente → 404', r.status === 404, `HTTP ${r.status}`);
+
+    const alq = { vehiculo_id: id, cliente: 'Cliente de prueba', fecha_inicio: '2030-01-01', fecha_fin: '2030-01-04' };
+
+    r = await api('POST', '/alquileres', { ...alq, fecha_inicio: '2030-01-04', fecha_fin: '2030-01-01' });
+    check('Fechas invertidas → 400', r.status === 400, `HTTP ${r.status}`);
+
+    r = await api('POST', '/alquileres', alq);
+    check('Crear alquiler → 201', r.status === 201, `HTTP ${r.status}`);
+    check('Costo = 3 días × 100000.00 = 300000.00', r.data && r.data.costo_total === '300000.00', r.data && `costo_total=${r.data.costo_total}`);
+    check('Alquiler nace ACTIVO', r.data && r.data.estado === 'ACTIVO');
+    const alquilerId = r.data && r.data.id;
+
+    r = await api('GET', `/vehiculos/${id}`);
+    check('Vehículo pasa a ALQUILADO', r.data && r.data.estado === 'ALQUILADO');
+
+    r = await api('POST', '/alquileres', alq);
+    check('Alquilar vehículo ocupado → 409', r.status === 409, `HTTP ${r.status}`);
+
+    r = await api('PUT', `/alquileres/${alquilerId}/finalizar`);
+    check('Finalizar alquiler → 200 FINALIZADO', r.status === 200 && r.data.estado === 'FINALIZADO', `HTTP ${r.status}`);
+
+    r = await api('GET', `/vehiculos/${id}`);
+    check('Vehículo vuelve a DISPONIBLE', r.data && r.data.estado === 'DISPONIBLE');
+
+    r = await api('PUT', `/alquileres/${alquilerId}/finalizar`);
+    check('Finalizar dos veces → 409', r.status === 409, `HTTP ${r.status}`);
+
+    r = await api('POST', '/alquileres', alq);
+    const segundoId = r.data && r.data.id;
+    r = await api('PUT', `/alquileres/${segundoId}/cancelar`);
+    check('Cancelar alquiler → 200 CANCELADO', r.status === 200 && r.data.estado === 'CANCELADO', `HTTP ${r.status}`);
+
+    r = await api('GET', `/vehiculos/${id}`);
+    check('Tras cancelar, vehículo DISPONIBLE', r.data && r.data.estado === 'DISPONIBLE');
+  } catch (err) {
+    check('Ejecución sin interrupciones', false, err.message);
+  }
+
+  const aprobadas = checks.filter((c) => c.ok).length;
+  const resumen = $('#resumen');
+  resumen.className = 'resumen ' + (aprobadas === checks.length ? 'ok' : 'error');
+  resumen.textContent = `${aprobadas} de ${checks.length} comprobaciones correctas`;
+  $('#tbl-checks tbody').innerHTML = checks.map((c) =>
+    `<tr><td>${c.ok ? '✅' : '❌'}</td><td>${esc(c.nombre)}</td><td>${esc(c.detalle)}</td></tr>`
+  ).join('');
+
+  boton.disabled = false;
+  await refrescar();
+});
+
+// ---------- Inicio ----------
+(function fechasPorDefecto() {
+  const hoy = new Date();
+  const manana = new Date(hoy.getTime() + 86400000);
+  const iso = (d) => d.toISOString().slice(0, 10);
+  $('#form-alquiler [name=fecha_inicio]').value = iso(hoy);
+  $('#form-alquiler [name=fecha_fin]').value = iso(manana);
+})();
+refrescar();
+</script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.db
+docs/guia_estudio_*.md
+/iteraciones/
+/iteracion_*_respuesta.md
